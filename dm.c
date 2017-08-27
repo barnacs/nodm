@@ -41,20 +41,10 @@ void nodm_display_manager_init(struct nodm_display_manager* dm)
     dm->conf_minimum_session_time = atoi(getenv_with_default("NODM_MIN_SESSION_TIME", "60"));
     dm->_srv_split_args = NULL;
     dm->_srv_split_argv = NULL;
-
-    // Save original signal mask
-    if (sigprocmask(SIG_BLOCK, NULL, &dm->orig_signal_mask) == -1)
-        log_err("sigprocmask error: %m");
-    dm->srv.orig_signal_mask = dm->orig_signal_mask;
-    dm->session.orig_signal_mask = dm->orig_signal_mask;
 }
 
 void nodm_display_manager_cleanup(struct nodm_display_manager* dm)
 {
-    // Restore original signal mask
-    if (sigprocmask(SIG_SETMASK, &dm->orig_signal_mask, NULL) == -1)
-        log_err("sigprocmask error: %m");
-
     nodm_vt_stop(&dm->vt);
 
     // Deallocate parsed arguments, if used
@@ -91,23 +81,8 @@ int nodm_display_manager_start(struct nodm_display_manager* dm)
     } else
         log_verb("skipped VT allocation");
 
-    // Block all signals
-    sigset_t blockmask;
-    if (sigfillset(&blockmask) == -1)
-    {
-        log_err("sigfillset error: %m");
-        return E_PROGRAMMING;
-    }
-    if (sigprocmask(SIG_BLOCK, &blockmask, NULL) == -1)
-    {
-        log_err("sigprocmask error: %m");
-        return E_PROGRAMMING;
-    }
-
     res = nodm_display_manager_restart(dm);
-    if (res != E_SUCCESS) return res;
-
-    return E_SUCCESS;
+    return res;
 }
 
 int nodm_display_manager_restart(struct nodm_display_manager* dm)
@@ -136,54 +111,8 @@ int nodm_display_manager_stop(struct nodm_display_manager* dm)
     return E_SUCCESS;
 }
 
-// Signal handler for wait loop
-static int quit_signal_caught = 0;
-static void catch_signals (int sig)
-{
-    ++quit_signal_caught;
-}
-
-static int setup_quit_notification(sigset_t* origset)
-{
-    /* Reset caught signal flag */
-    quit_signal_caught = 0;
-
-    struct sigaction action;
-    action.sa_handler = catch_signals;
-    sigemptyset (&action.sa_mask);
-    action.sa_flags = 0;
-
-    sigset_t ourset;
-    if (sigemptyset(&ourset)
-        || sigaddset(&ourset, SIGTERM)
-        || sigaddset(&ourset, SIGINT)
-        || sigaddset(&ourset, SIGQUIT)
-        || sigaction(SIGTERM, &action, NULL)
-        || sigaction(SIGINT, &action, NULL)
-        || sigaction(SIGQUIT, &action, NULL)
-        || sigprocmask(SIG_UNBLOCK, &ourset, origset)
-        ) {
-        log_err("signal operations error: %m");
-        return E_PROGRAMMING;
-    }
-    return E_SUCCESS;
-}
-
-static void shutdown_quit_notification(const sigset_t* origset)
-{
-    if (sigprocmask(SIG_SETMASK, origset, NULL) == -1)
-        log_err("sigprocmask error: %m");
-}
-
 int nodm_display_manager_wait(struct nodm_display_manager* dm, int* session_status)
 {
-    int res = E_SUCCESS;
-
-    // Catch the normal termination signals using 'catch_signals'
-    sigset_t origset;
-    res = setup_quit_notification(&origset);
-    if (res != E_SUCCESS) return res;
-
     *session_status = -1;
     while (true)
     {
@@ -194,20 +123,12 @@ int nodm_display_manager_wait(struct nodm_display_manager* dm, int* session_stat
         {
             if (errno == EINTR)
             {
-                if (quit_signal_caught)
-                {
-                    log_info("shutdown signal received");
-                    res = E_USER_QUIT;
-                    goto cleanup;
-                }
-                else
-                    continue;
+                continue;
             }
             else
             {
                 log_warn("waitpid error: %m");
-                res = E_OS_ERROR;
-                goto cleanup;
+                return E_OS_ERROR;
             }
         }
 
@@ -215,20 +136,15 @@ int nodm_display_manager_wait(struct nodm_display_manager* dm, int* session_stat
         {
             // Server died
             nodm_xserver_report_exit(&dm->srv, status);
-            res = E_X_SERVER_DIED;
-            goto cleanup;
+            return E_X_SERVER_DIED;
         } else if (child == dm->session.pid) {
             // Session died
             nodm_xsession_report_exit(&dm->session, status);
             *session_status = status;
-            res = E_SESSION_DIED;
-            goto cleanup;
+            return E_SESSION_DIED;
         }
     }
-
-cleanup:
-    shutdown_quit_notification(&origset);
-    return res;
+    return E_SUCCESS;
 }
 
 int nodm_display_manager_parse_xcmdline(struct nodm_display_manager* s, const char* xcmdline)
@@ -324,11 +240,6 @@ static int interruptible_sleep(int seconds)
 {
     int res = E_SUCCESS;
 
-    // Catch the normal termination signals using 'catch_signals'
-    sigset_t origset;
-    res = setup_quit_notification(&origset);
-    if (res != E_SUCCESS) return res;
-
     struct timespec tosleep = { .tv_sec = seconds, .tv_nsec = 0 };
     struct timespec remaining;
     while (true)
@@ -338,12 +249,7 @@ static int interruptible_sleep(int seconds)
             break;
         else if (errno == EINTR)
         {
-            if (quit_signal_caught)
-            {
-                res = E_USER_QUIT;
-                break;
-            } else
-                tosleep = remaining;
+            tosleep = remaining;
         }
         else
         {
@@ -352,7 +258,6 @@ static int interruptible_sleep(int seconds)
         }
     }
 
-    shutdown_quit_notification(&origset);
     return res;
 }
 
